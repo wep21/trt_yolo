@@ -17,6 +17,7 @@
 
 #include <cuda_utils.h>
 #include <mish_plugin.hpp>
+#include <nms_plugin.hpp>
 #include <yolo_layer_plugin.hpp>
 
 struct deleter
@@ -127,22 +128,28 @@ int main(int argc, char * argv[])
   if (!parser->parseFromFile(argv[1], static_cast<int>(nvinfer1::ILogger::Severity::kERROR))) {
     return false;
   }
-  std::vector<nvinfer1::ITensor *> detections;
+  std::vector<nvinfer1::ITensor *> scores, boxes, classes;
   auto input = network->getInput(0);
   auto num_outputs = network->getNbOutputs();
-  float anchors[3][6] = {12, 16, 19,  36,  40,  28,  36,  75,  76,
-                         55, 72, 146, 142, 110, 192, 243, 459, 401};
-  float scale_x_y[3] = {1.2, 1.1, 1.05};
+  // float anchors[3][6] = {12, 16, 19,  36,  40,  28,  36,  75,  76,
+  //                        55, 72, 146, 142, 110, 192, 243, 459, 401};
+  float anchors[3][6] = {116, 90, 156, 198, 373, 326, 30, 61, 62,
+                         45,  59, 119, 10,  13,  16,  30, 33, 23};
+  // float scale_x_y[3] = {1.2, 1.1, 1.05};
+  float scale_x_y[3] = {1.0, 1.0, 1.0};
+  auto input_dims = input->getDimensions();
+  auto input_width = input_dims.d[2];
+  auto input_height = input_dims.d[3];
   for (int i = 0; i < num_outputs; ++i) {
-    auto input_dims = input->getDimensions();
-    auto input_width = input_dims.d[2];
-    auto input_height = input_dims.d[3];
     auto output = network->getOutput(i);
+    std::vector<float> anchor(std::begin(anchors[i]), std::end(anchors[i]));
     auto yoloLayerPlugin =
-      yolo::YoloLayerPlugin(input_width, input_height, anchors[i], scale_x_y[i], 0.1);
+      yolo::YoloLayerPlugin(input_width, input_height, 3, anchor, scale_x_y[i], 0.1);
     std::vector<nvinfer1::ITensor *> inputs = {output};
     auto layer = network->addPluginV2(inputs.data(), inputs.size(), yoloLayerPlugin);
-    detections.push_back(layer->getOutput(0));
+    scores.push_back(layer->getOutput(0));
+    boxes.push_back(layer->getOutput(1));
+    classes.push_back(layer->getOutput(2));
   }
 
   // Cleanup outputs
@@ -151,13 +158,26 @@ int main(int argc, char * argv[])
     network->unmarkOutput(*output);
   }
 
-  auto layer = network->addConcatenation(detections.data(), detections.size());
-  auto concat_output = layer->getOutput(0);
-  network->markOutput(*concat_output);
+  // Concat tensors from each feature map
+  std::vector<nvinfer1::ITensor *> concat;
+  for (auto tensors : {scores, boxes, classes}) {
+    auto layer = network->addConcatenation(tensors.data(), tensors.size());
+    layer->setAxis(1);
+    auto output = layer->getOutput(0);
+    concat.push_back(output);
+  }
+
+  // Add NMS plugin
+  auto nmsPlugin = yolo::NMSPlugin(0.45, 100);
+  auto layer = network->addPluginV2(concat.data(), concat.size(), nmsPlugin);
+  for (int i = 0; i < layer->getNbOutputs(); i++) {
+    auto output = layer->getOutput(i);
+    network->markOutput(*output);
+  }
 
   int max_batch_size = 1;
   builder->setMaxBatchSize(max_batch_size);
-  config->setMaxWorkspaceSize(1 << 24);
+  config->setMaxWorkspaceSize(1 << 30);
   // config->setFlag(nvinfer1::BuilderFlag::kFP16);
   std::unique_ptr<nvinfer1::ICudaEngine, deleter> engine;
   std::ifstream file(argv[2], std::ios::in | std::ios::binary);
@@ -211,46 +231,37 @@ int main(int argc, char * argv[])
   cudaStreamCreate(&stream);
   auto data_d = cuda::make_unique<float[]>(channels * input_h * input_w);
   cudaMemcpy(data_d.get(), data.data(), data.size() * sizeof(float), cudaMemcpyHostToDevice);
-  auto out_d = cuda::make_unique<float[]>(6 * (76 * 76 + 38 * 38 + 19 * 19) * 3);
-  std::vector<void *> buffers = {data_d.get(), out_d.get()};
+  auto out_scores_d = cuda::make_unique<float[]>(100);
+  auto out_boxes_d = cuda::make_unique<float[]>(4 * 100);
+  auto out_classes_d = cuda::make_unique<float[]>(100);
+  std::vector<void *> buffers = {data_d.get(), out_scores_d.get(), out_boxes_d.get(),
+                                 out_classes_d.get()};
   context->enqueueV2(buffers.data(), stream, nullptr);
 
-  auto out = std::make_unique<float[]>(6 * (76 * 76 + 38 * 38 + 19 * 19) * 3);
+  auto out_scores = std::make_unique<float[]>(100);
+  auto out_boxes = std::make_unique<float[]>(4 * 100);
+  auto out_classes = std::make_unique<float[]>(100);
   cudaMemcpyAsync(
-    out.get(), out_d.get(), sizeof(float) * 6 * (76 * 76 + 38 * 38 + 19 * 19) * 3,
-    cudaMemcpyDeviceToHost, stream);
+    out_scores.get(), out_scores_d.get(), sizeof(float) * 100, cudaMemcpyDeviceToHost, stream);
+  cudaMemcpyAsync(
+    out_boxes.get(), out_boxes_d.get(), sizeof(float) * 4 * 100, cudaMemcpyDeviceToHost, stream);
+  cudaMemcpyAsync(
+    out_classes.get(), out_classes_d.get(), sizeof(float) * 100, cudaMemcpyDeviceToHost, stream);
   cudaStreamSynchronize(stream);
-  /* auto out_image = orig_image.clone();
-	for (int i = 0; i < num_classes; i++)
-	{
-		std::vector<float> probs;
-		std::vector<cv::Rect2d> subset_boxes;
-		std::vector<int> indices;
-		for (int j = 0; j < num_detection; j++)
-		{
-			probs.push_back(scores[i + j * num_classes]);
-			subset_boxes.push_back(cv::Rect2d(cv::Point2d(boxes[j * 4], boxes[j * 4 + 1]),
-				                              cv::Point2d(boxes[j * 4 + 2], boxes[j * 4 + 3])));
-			if (probs.size() == 0)
-			{
-				continue;
-			}
-		}
-		cv::dnn::NMSBoxes(subset_boxes, probs, score_threshold, iou_threshold, indices);
-		for (const auto& index: indices)
-		{
-			if (i != 0)
-			{
-				cv::Point2f tl(subset_boxes[index].tl().x * orig_image.cols, subset_boxes[index].tl().y * orig_image.rows);
-				cv::Point2f br(subset_boxes[index].br().x * orig_image.cols, subset_boxes[index].br().y * orig_image.rows);
-				cv::rectangle(out_image, tl, br, cv::Scalar(255, 255 / num_classes * i, 0), 3);
-				cv::putText(out_image, label[i] + ": " + std::to_string(probs[index]), cvPoint(tl.x, tl.y -10), CV_FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(255, 255 / num_classes * i, 0), 3);
-			}
-		}
-	}*/
+  auto out_image = orig_image.clone();
+  for (int i = 0; i < 100; ++i) {
+    if (out_scores[i] < 0.3) break;
+    const auto x = out_boxes[i * 4] * orig_image.cols;
+    const auto y = out_boxes[i * 4 + 1] * orig_image.rows;
+    const auto w = out_boxes[i * 4 + 2] * orig_image.cols;
+    const auto h = out_boxes[i * 4 + 3] * orig_image.rows;
+    cv::Point2f tl(x, y);
+    cv::Point2f br(x + w, y + h);
+    cv::rectangle(out_image, tl, br, cv::Scalar(255, 255 / 80 * out_scores[i], 0), 3);
+  }
   end = std::chrono::high_resolution_clock::now();
   double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
   std::cout << "exec time: " << elapsed << std::endl;
-  // cv::imwrite("output.jpg", out_image);
+  cv::imwrite("output_v3.jpg", out_image);
   return 0;
 }

@@ -1,5 +1,5 @@
 project(cublas_test)
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.5)
 set(CMAKE_CXX_STANDARD 14)
 set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} -lineinfo")
 
@@ -27,6 +27,11 @@ cuda_add_library(yolo_layer_plugin SHARED
   yolo_layer_plugin.cpp
 )
 
+cuda_add_library(nms_plugin SHARED
+  nms.cu
+  nms_plugin.cpp
+)
+
 add_executable(trt_yolov4 main.cpp)
 target_link_libraries(trt_yolov4
     ${OpenCV_LIBS}
@@ -38,4 +43,5 @@ target_link_libraries(trt_yolov4
     ${CUDA_curand_LIBRARY}
     mish_plugin
     yolo_layer_plugin
+    nms_plugin
   )

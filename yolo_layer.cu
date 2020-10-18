@@ -1,6 +1,36 @@
-#include <cuda_runtime_api.h>
 #include <stdio.h>
-#include "yolo_layer_plugin.hpp"
+#include <stdexcept>
+#include "math_constants.h"
+#include "yolo_layer.h"
+
+namespace
+{
+static constexpr size_t CUDA_ALIGN = 256;
+
+template <typename T>
+inline size_t get_size_aligned(size_t num_elem)
+{
+  size_t size = num_elem * sizeof(T);
+  size_t extra_align = 0;
+  if (size % CUDA_ALIGN != 0) {
+    extra_align = CUDA_ALIGN - size % CUDA_ALIGN;
+  }
+  return size + extra_align;
+}
+
+template <typename T>
+inline T * get_next_ptr(size_t num_elem, void *& workspace, size_t & workspace_size)
+{
+  size_t size = get_size_aligned<T>(num_elem);
+  if (size > workspace_size) {
+    throw std::runtime_error("Workspace is too small!");
+  }
+  workspace_size -= size;
+  T * ptr = reinterpret_cast<T *>(workspace);
+  workspace = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(workspace) + size);
+  return ptr;
+}
+}  // namespace
 
 namespace yolo
 {
@@ -59,14 +89,24 @@ __global__ void yoloLayerKernel(
 
   // det->det_confidence = box_prob;
   *out_class = class_id;
-  *out_score = max_cls_prob * objectness < score_thresh ? 0.0 : max_cls_prob * objectness;
+  *out_score = objectness < score_thresh ? 0.0 : max_cls_prob * objectness;
 }
 
-int YoloLayerPlugin::yoloLayer(
-  int batch_size, const void * const * inputs, void * const * outputs, int grid_width, int grid_height,
-  int num_classes, int num_anchors, const float * anchors_d, int input_width, int input_height,
-  float scale_xy, float score_thresh, cudaStream_t stream)
+int yoloLayer(
+  int batch_size, const void * const * inputs, void * const * outputs, int grid_width,
+  int grid_height, int num_classes, int num_anchors, const std::vector<float> & anchors,
+  int input_width, int input_height, float scale_x_y, float score_thresh, void * workspace,
+  size_t workspace_size, cudaStream_t stream)
 {
+  if (!workspace || !workspace_size) {
+    workspace_size = get_size_aligned<float>(anchors.size());
+    return workspace_size;
+  }
+
+  auto anchors_d = get_next_ptr<float>(anchors.size(), workspace, workspace_size);
+  cudaMemcpyAsync(
+    anchors_d, anchors.data(), anchors.size() * sizeof *anchors_d, cudaMemcpyHostToDevice, stream);
+
   int num_elements = num_anchors * grid_width * grid_height;
   constexpr int block_size = 256;
   const int grid_size = (num_elements + block_size - 1) / block_size;
@@ -78,7 +118,7 @@ int YoloLayerPlugin::yoloLayer(
     auto out_classes = static_cast<float *>(outputs[2]) + batch * num_elements;
     yoloLayerKernel<block_size><<<grid_size, block_size, 0, stream>>>(
       input, out_scores, out_boxes, out_classes, grid_width, grid_height, num_classes, num_anchors,
-      anchors_d, input_width, input_height, scale_xy, score_thresh);
+      anchors_d, input_width, input_height, scale_x_y, score_thresh);
   }
   return 0;
 }

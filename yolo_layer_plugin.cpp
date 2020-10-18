@@ -4,13 +4,14 @@
 #include <string.h>
 #include <cassert>
 #include <cmath>
+#include "yolo_layer.h"
 
 using namespace nvinfer1;
 
 namespace
 {
 const char * YOLO_LAYER_PLUGIN_VERSION{"1"};
-const char * YOLO_LAYER_PLUGIN_NAME{"Yolo_Layer_TRT"};
+const char * YOLO_LAYER_PLUGIN_NAME{"YOLO_Layer_TRT"};
 const char * YOLO_LAYER_PLUGIN_NAMESPACE{""};
 
 template <typename T>
@@ -31,13 +32,13 @@ void read(const char *& buffer, T & val)
 namespace yolo
 {
 YoloLayerPlugin::YoloLayerPlugin(
-  int width, int height, int num_anchors, std::vector<float> & anchors, float scale_xy,
+  int width, int height, int num_anchors, std::vector<float> & anchors, float scale_x_y,
   float score_thresh)
 : width_(width),
   height_(height),
   num_anchors_(num_anchors),
   anchors_(anchors),
-  scale_xy_(scale_xy),
+  scale_x_y_(scale_x_y),
   score_thresh_(score_thresh)
 {
 }
@@ -50,24 +51,23 @@ YoloLayerPlugin::YoloLayerPlugin(const void * data, size_t length)
   read(d, height_);
   read(d, num_anchors_);
   int anchor_size = num_anchors_ * 2;
-  while (--anchor_size) {
+  while (anchor_size--) {
     float val;
     read(d, val);
     anchors_.push_back(val);
   }
-  read(d, scale_xy_);
+  read(d, scale_x_y_);
   read(d, score_thresh_);
 
   assert(d == a + length);
 }
-
 // IPluginV2 Methods
 
 const char * YoloLayerPlugin::getPluginType() const { return YOLO_LAYER_PLUGIN_NAME; }
 
 const char * YoloLayerPlugin::getPluginVersion() const { return YOLO_LAYER_PLUGIN_VERSION; }
 
-int YoloLayerPlugin::getNbOutputs() const { return 1; }
+int YoloLayerPlugin::getNbOutputs() const { return 3; }
 
 int YoloLayerPlugin::initialize() { return 0; }
 
@@ -76,7 +76,7 @@ void YoloLayerPlugin::terminate() {}
 size_t YoloLayerPlugin::getSerializationSize() const
 {
   return sizeof(width_) + sizeof(height_) + sizeof(num_anchors_) +
-         sizeof(float) * num_anchors_ * 2 + sizeof(scale_xy_) + sizeof(score_thresh_);
+         sizeof(float) * num_anchors_ * 2 + sizeof(scale_x_y_) + sizeof(score_thresh_);
 }
 
 void YoloLayerPlugin::serialize(void * buffer) const
@@ -88,7 +88,7 @@ void YoloLayerPlugin::serialize(void * buffer) const
   for (int i = 0; i < num_anchors_ * 2; ++i) {
     write(d, anchors_[i]);
   }
-  write(d, scale_xy_);
+  write(d, scale_x_y_);
   write(d, score_thresh_);
 
   assert(d == a + getSerializationSize());
@@ -96,12 +96,9 @@ void YoloLayerPlugin::serialize(void * buffer) const
 
 void YoloLayerPlugin::destroy() { delete this; }
 
-void YoloLayerPlugin::setPluginNamespace(const char * pluginNamespace)
-{
-  mPluginNamespace = pluginNamespace;
-}
+void YoloLayerPlugin::setPluginNamespace(const char * N) {}
 
-const char * YoloLayerPlugin::getPluginNamespace() const { return mPluginNamespace; }
+const char * YoloLayerPlugin::getPluginNamespace() const { return YOLO_LAYER_PLUGIN_NAMESPACE; }
 
 // IPluginV2Ext Methods
 
@@ -115,9 +112,7 @@ DataType YoloLayerPlugin::getOutputDataType(
 
 IPluginV2DynamicExt * YoloLayerPlugin::clone() const
 {
-  auto plugin = new YoloLayerPlugin(*this);
-  plugin->setPluginNamespace(mPluginNamespace);
-  return plugin;
+  return new YoloLayerPlugin(*this);
 }
 
 DimsExprs YoloLayerPlugin::getOutputDimensions(
@@ -126,16 +121,19 @@ DimsExprs YoloLayerPlugin::getOutputDimensions(
   DimsExprs ret = inputs[0];
   ret.nbDims = 3;
   const auto total_count =
-    ret.d[2]->getConstantValue() * ret.d[3]->getConstantValue() * num_anchors_ * 6;
-  ret.d[1] = exprBuilder.constant(total_count);
+    ret.d[2]->getConstantValue() * ret.d[3]->getConstantValue() * num_anchors_;
+  ret.d[1] = exprBuilder.constant(total_count * (outputIndex == 1 ? 4 : 1));
   ret.d[2] = exprBuilder.constant(1);
   ret.d[3] = exprBuilder.constant(1);
   return ret;
 }
 
 bool YoloLayerPlugin::supportsFormatCombination(
-  int pos, const nvinfer1::PluginTensorDesc * inOut, int nbInputs, int nbOutputs)
+  int pos, const PluginTensorDesc * inOut, int nbInputs, int nbOutputs)
 {
+  assert(nbInputs == 1);
+  assert(nbOutputs == 3);
+  assert(pos < 4);
   return inOut[pos].type == DataType::kFLOAT && inOut[pos].format == PluginFormat::kLINEAR;
 }
 
@@ -151,7 +149,16 @@ size_t YoloLayerPlugin::getWorkspaceSize(
   const nvinfer1::PluginTensorDesc * inputs, int nbInputs,
   const nvinfer1::PluginTensorDesc * outputs, int nbOutputs) const
 {
-  return 0;
+  if (size < 0) {
+    const int batch_size = inputs[0].dims.d[0];
+    const int grid_width = inputs[0].dims.d[2];
+    const int grid_height = inputs[0].dims.d[3];
+    const int num_classes = inputs[0].dims.d[1] / num_anchors_ - 5;
+    size = yoloLayer(
+      batch_size, nullptr, nullptr, grid_width, grid_height, num_classes, num_anchors_, anchors_,
+      width_, height_, scale_x_y_, score_thresh_, nullptr, 0, nullptr);
+  }
+  return size;
 }
 
 int YoloLayerPlugin::enqueue(
@@ -164,11 +171,10 @@ int YoloLayerPlugin::enqueue(
   const int num_classes = inputDesc[0].dims.d[1] / num_anchors_ - 5;
 
   int status = -1;
-  const float * input = static_cast<const float *>(inputs[0]);
-  float * output = static_cast<float *>(outputs[0]);
   status = yoloLayer(
-    inputDesc[0].dims.d[0], inputs, outputs, grid_width, grid_height, num_classes, num_anchors_,
-    anchors_d_, width_, height_, scale_xy_, score_thresh_, stream);
+    batch_size, inputs, outputs, grid_width, grid_height, num_classes, num_anchors_, anchors_,
+    width_, height_, scale_x_y_, score_thresh_, workspace,
+    getWorkspaceSize(inputDesc, 1, outputDesc, 3), stream);
   return status;
 }
 

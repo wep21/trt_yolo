@@ -1,30 +1,40 @@
+/*
+ * Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
+
 #pragma once
 
-#include <array>
-#include <iostream>
-#include <string>
-#include <vector>
-#include "NvInferPlugin.h"
+#include <NvInfer.h>
 
-#define CHECK(status)                                                                           \
-  do {                                                                                          \
-    auto ret = status;                                                                          \
-    if (ret != 0) {                                                                             \
-      std::cerr << "Cuda failure in file '" << __FILE__ << "' line " << __LINE__ << ": " << ret \
-                << std::endl;                                                                   \
-      abort();                                                                                  \
-    }                                                                                           \
-  } while (0)
+#include <cassert>
+#include <vector>
 
 namespace yolo
 {
-class YoloLayerPlugin : public nvinfer1::IPluginV2DynamicExt
+class NMSPlugin : public nvinfer1::IPluginV2DynamicExt
 {
 public:
-  explicit YoloLayerPlugin(
-    int width, int height, int num_classes, std::vector<float> & anchors, float scale_xy,
-    float score_thresh);
-  YoloLayerPlugin(const void * data, size_t length);
+  NMSPlugin(float nms_thresh, int detections_per_im);
+  NMSPlugin(float nms_thresh, int detections_per_im, size_t count);
+  NMSPlugin(const void * data, size_t length);
 
   // IPluginV2 methods
   const char * getPluginType() const override;
@@ -61,13 +71,10 @@ public:
     cudaStream_t stream) override;
 
 private:
-  const char * mPluginNamespace;
-  int width_;
-  int height_;
-  int num_anchors_;
-  float scale_x_y_;
-  std::vector<float> anchors_;
-  float score_thresh_;
+  float nms_thresh_;
+  int detections_per_im_;
+
+  size_t count_;
   mutable int size = -1;
 
 protected:
@@ -81,10 +88,10 @@ protected:
   using nvinfer1::IPluginV2DynamicExt::supportsFormat;
 };
 
-class YoloLayerPluginCreator : public nvinfer1::IPluginCreator
+class NMSPluginCreator : public nvinfer1::IPluginCreator
 {
 public:
-  YoloLayerPluginCreator();
+  NMSPluginCreator();
 
   const char * getPluginName() const override;
 
@@ -103,6 +110,6 @@ public:
   const char * getPluginNamespace() const override;
 };
 
-REGISTER_TENSORRT_PLUGIN(YoloLayerPluginCreator);
+REGISTER_TENSORRT_PLUGIN(NMSPluginCreator);
 
 }  // namespace yolo
