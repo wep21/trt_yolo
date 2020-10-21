@@ -83,6 +83,15 @@ __global__ void yoloLayerKernel(
   auto h = __expf(cur_input[idx + 3 * total_grids]) * anchors[2 * anchor_idx + 1] /
            input_height;  // [0, 1]
 
+  // auto x = (col + sigmoid(cur_input[idx + 0 * total_grids]) * 2 - 0.5) / grid_width;   // [0, 1]
+  // auto y = (row + sigmoid(cur_input[idx + 1 * total_grids]) * 2 - 0.5) / grid_height;  // [0, 1]
+  // auto w = (sigmoid(cur_input[idx + 2 * total_grids]) * 2) *
+  //          (sigmoid(cur_input[idx + 2 * total_grids]) * 2) * anchors[2 * anchor_idx] /
+  //          input_width;  // [0, 1]
+  // auto h = (sigmoid(cur_input[idx + 3 * total_grids]) * 2) *
+  //          (sigmoid(cur_input[idx + 3 * total_grids]) * 2) * anchors[2 * anchor_idx + 1] /
+  //          input_height;  // [0, 1]
+
   x -= w / 2;  // shift from center to top-left
   y -= h / 2;
   *out_box = make_float4(x, y, w, h);

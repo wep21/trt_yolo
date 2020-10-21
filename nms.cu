@@ -93,12 +93,12 @@ __global__ void nms_kernel(
           float4 mbox = boxes[max_idx];
           float x1 = max(ibox.x, mbox.x);
           float y1 = max(ibox.y, mbox.y);
-          float x2 = min(ibox.z, mbox.z);
-          float y2 = min(ibox.w, mbox.w);
-          float w = max(0.0f, x2 - x1 + 1);
-          float h = max(0.0f, y2 - y1 + 1);
-          float iarea = (ibox.z - ibox.x + 1) * (ibox.w - ibox.y + 1);
-          float marea = (mbox.z - mbox.x + 1) * (mbox.w - mbox.y + 1);
+          float x2 = min(ibox.x + ibox.z, mbox.x + mbox.z);
+          float y2 = min(ibox.y + ibox.w, ibox.y + mbox.w);
+          float w = max(0.0f, x2 - x1);
+          float h = max(0.0f, y2 - y1);
+          float iarea = ibox.z * ibox.w;
+          float marea = mbox.z * mbox.w;
           float inter = w * h;
           float overlap = inter / (iarea + marea - inter);
           if (overlap > threshold) {

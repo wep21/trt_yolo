@@ -46,13 +46,9 @@ private:
   bool _verbose{false};
 };
 
-std::vector<float> prepareImage(const cv::Mat & img)
+std::vector<float> prepareImage(const cv::Mat & img, const int c, const int w, const int h)
 {
   using namespace cv;
-
-  int c = 3;
-  int h = 608;  //net h
-  int w = 608;  //net w
 
   float scale = min(float(w) / img.cols, float(h) / img.rows);
   auto scaleSize = cv::Size(img.cols * scale, img.rows * scale);
@@ -92,18 +88,8 @@ int main(int argc, char * argv[])
 {
   assert(argc == 4);
   Logger logger(true);
-  const int num_classes = 21;
-  const int num_detection = 3000;
-  const float score_threshold = 0.4;
-  const float iou_threshold = 0.45;
-  std::vector<std::string> label{
-    "BG",        "aeroplane", "bicycle",     "bird",  "boat",        "bottle", "bus",
-    "car",       "cat",       "chair",       "cow",   "diningtable", "dog",    "horse",
-    "motorbike", "person",    "pottedplant", "sheep", "sofa",        "train",  "tvmonitor"};
 
   std::chrono::high_resolution_clock::time_point start, end;
-  const int input_w = 608;
-  const int input_h = 608;
 
   auto builder = std::unique_ptr<nvinfer1::IBuilder, deleter>(nvinfer1::createInferBuilder(logger));
   if (!builder) {
@@ -131,13 +117,16 @@ int main(int argc, char * argv[])
   std::vector<nvinfer1::ITensor *> scores, boxes, classes;
   auto input = network->getInput(0);
   auto num_outputs = network->getNbOutputs();
-  // float anchors[3][6] = {12, 16, 19,  36,  40,  28,  36,  75,  76,
-  //                        55, 72, 146, 142, 110, 192, 243, 459, 401};
-  float anchors[3][6] = {116, 90, 156, 198, 373, 326, 30, 61, 62,
-                         45,  59, 119, 10,  13,  16,  30, 33, 23};
-  // float scale_x_y[3] = {1.2, 1.1, 1.05};
-  float scale_x_y[3] = {1.0, 1.0, 1.0};
+  // float anchors[3][6] = {116, 90, 156, 198, 373, 326, 30, 61, 62,
+  //                        45,  59, 119, 10,  13,  16,  30, 33, 23};
+  float anchors[3][6] = {12, 16, 19,  36,  40,  28,  36,  75,  76,
+                         55, 72, 146, 142, 110, 192, 243, 459, 401};
+  // float anchors[3][6] = {10, 13, 16,  30,  33, 23,  30,  61,  62,
+  //                        45, 59, 119, 116, 90, 156, 198, 373, 326};
+  float scale_x_y[3] = {1.2, 1.1, 1.05};
+  // float scale_x_y[3] = {1.0, 1.0, 1.0};
   auto input_dims = input->getDimensions();
+  auto input_channel = input_dims.d[1];
   auto input_width = input_dims.d[2];
   auto input_height = input_dims.d[3];
   for (int i = 0; i < num_outputs; ++i) {
@@ -168,7 +157,7 @@ int main(int argc, char * argv[])
   }
 
   // Add NMS plugin
-  auto nmsPlugin = yolo::NMSPlugin(0.45, 100);
+  auto nmsPlugin = yolo::NMSPlugin(0.2, 100);
   auto layer = network->addPluginV2(concat.data(), concat.size(), nmsPlugin);
   for (int i = 0; i < layer->getNbOutputs(); i++) {
     auto output = layer->getOutput(i);
@@ -216,12 +205,11 @@ int main(int argc, char * argv[])
   start = std::chrono::high_resolution_clock::now();
   auto orig_image = cv::imread(argv[3], cv::IMREAD_COLOR);
   auto image = orig_image.clone();
-  cv::resize(image, image, cv::Size(input_w, input_h));
+  cv::resize(image, image, cv::Size(input_width, input_height));
   cv::Mat pixels;
   image.convertTo(pixels, CV_32FC3, 1.0 / 255, 0);
-  const int channels = 3;
-  std::vector<float> data(channels * input_w * input_h);
-  data = prepareImage(image);
+  std::vector<float> data(input_channel * input_width * input_height);
+  data = prepareImage(image, input_channel, input_width, input_height);
 
   // inference
 
@@ -229,7 +217,7 @@ int main(int argc, char * argv[])
     std::unique_ptr<nvinfer1::IExecutionContext, deleter>(engine->createExecutionContext());
   cudaStream_t stream = nullptr;
   cudaStreamCreate(&stream);
-  auto data_d = cuda::make_unique<float[]>(channels * input_h * input_w);
+  auto data_d = cuda::make_unique<float[]>(input_channel * input_width * input_height);
   cudaMemcpy(data_d.get(), data.data(), data.size() * sizeof(float), cudaMemcpyHostToDevice);
   auto out_scores_d = cuda::make_unique<float[]>(100);
   auto out_boxes_d = cuda::make_unique<float[]>(4 * 100);
@@ -250,7 +238,8 @@ int main(int argc, char * argv[])
   cudaStreamSynchronize(stream);
   auto out_image = orig_image.clone();
   for (int i = 0; i < 100; ++i) {
-    if (out_scores[i] < 0.3) break;
+    if (out_scores[i] < 0.5) break;
+    std::cout << out_classes[i] << std::endl;
     const auto x = out_boxes[i * 4] * orig_image.cols;
     const auto y = out_boxes[i * 4 + 1] * orig_image.rows;
     const auto w = out_boxes[i * 4 + 2] * orig_image.cols;
@@ -262,6 +251,6 @@ int main(int argc, char * argv[])
   end = std::chrono::high_resolution_clock::now();
   double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
   std::cout << "exec time: " << elapsed << std::endl;
-  cv::imwrite("output_v3.jpg", out_image);
+  cv::imwrite("output.jpg", out_image);
   return 0;
 }
